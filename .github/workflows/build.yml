@@ -16,13 +16,24 @@ jobs:
           java-version: "17"
 
       - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.14.3"
+
+      - name: Najít projekt
+        id: najit
+        run: |
+          echo "Obsah repozitáře:"
+          find . -maxdepth 3 -not -path './.git*' | sort
+          F=$(find . -name settings.gradle.kts -not -path './.git/*' | head -n1)
+          if [ -z "$F" ]; then echo "::error::Soubor settings.gradle.kts nebyl nalezen – projekt není nahraný celý"; exit 1; fi
+          echo "dir=$(dirname "$F")" >> "$GITHUB_OUTPUT"
+          echo "Projekt nalezen ve: $(dirname "$F")"
 
       - name: Sestavení
-        run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon assembleRelease
+        working-directory: ${{ steps.najit.outputs.dir }}
+        run: gradle --no-daemon assembleRelease
 
       - uses: actions/upload-artifact@v4
         with:
           name: entradio-tisk-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: "**/app/build/outputs/apk/release/*.apk"
