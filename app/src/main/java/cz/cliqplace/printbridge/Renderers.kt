@@ -72,51 +72,74 @@ object Renderers {
     // ---------- HTML ----------
 
     /**
-     * Vykreslí HTML mimo obrazovku do bitmapy. Musí se volat mimo hlavní vlákno.
-     * Šířka obsahu se zjistí z <body> (např. šablona s width: 80mm) a výsledek se škáluje na šířku hlavy.
+     * Vykreslí HTML mimo obrazovku. Musí se volat mimo hlavní vlákno.
+     *
+     * - [pageWidthCss] > 0: stránka se rozvrhne na tuto šířku (QZ volba pageWidth, např. 80 mm),
+     *   jinak se šířka zjistí z <body> (šablona má width: 80mm).
+     * - Výsledek se rozdělí na stránky podle CSS page-break-after / break-after
+     *   (i z @media print), takže každá vstupenka se vytiskne a ustřihne zvlášť.
      */
-    fun renderHtml(ctx: Context, html: String, baseUrl: String?, widthPx: Int): Bitmap {
-        val future = CompletableFuture<Bitmap>()
+    fun renderHtml(ctx: Context, html: String, baseUrl: String?, widthPx: Int, pageWidthCss: Double = 0.0): List<Bitmap> {
+        val future = CompletableFuture<List<Bitmap>>()
         val main = Handler(Looper.getMainLooper())
+        var job: HtmlJob? = null
         main.post {
             try {
-                HtmlJob(ctx, main, widthPx, future).start(html, baseUrl)
+                job = HtmlJob(ctx, main, widthPx, pageWidthCss, future).also { it.start(html, baseUrl) }
             } catch (e: Throwable) {
                 future.completeExceptionally(e)
             }
         }
         return try {
-            future.get(40, TimeUnit.SECONDS)
+            future.get(45, TimeUnit.SECONDS)
         } catch (e: java.util.concurrent.TimeoutException) {
+            main.post { job?.abort() }
             throw IOException("Vykreslení HTML trvalo příliš dlouho")
         } catch (e: java.util.concurrent.ExecutionException) {
             throw IOException("Vykreslení HTML selhalo: ${e.cause?.message}")
         }
     }
 
+    private const val MEASURE_JS = """(function(){
+var b=document.body,d=document.documentElement,r=b.getBoundingClientRect(),sy=window.scrollY||0,cuts=[],sel=[];
+function add(el){var q=el.getBoundingClientRect();if(q.height>0)cuts.push(q.bottom+sy);}
+function isBreak(st){var a=(st.pageBreakAfter||'')+' '+(st.breakAfter||'');return /always|page/.test(a);}
+function walk(rs){for(var j=0;j<rs.length;j++){var ru=rs[j];
+ if(ru.cssRules&&!ru.selectorText){try{walk(ru.cssRules);}catch(e){}}
+ else if(ru.style&&ru.selectorText&&isBreak(ru.style))sel.push(ru.selectorText);}}
+for(var i=0;i<document.styleSheets.length;i++){try{walk(document.styleSheets[i].cssRules);}catch(e){}}
+sel.forEach(function(s){try{document.querySelectorAll(s).forEach(add);}catch(e){}});
+var all=b.getElementsByTagName('*');for(var k=0;k<all.length;k++){try{if(isBreak(getComputedStyle(all[k])))add(all[k]);}catch(e){}}
+return {w:Math.max(r.right,1),h:Math.max(d.scrollHeight,b.scrollHeight,r.bottom+sy),cuts:cuts};
+})()"""
+
     private class HtmlJob(
         val ctx: Context,
         val main: Handler,
         val widthPx: Int,
-        val future: CompletableFuture<Bitmap>
+        val pageWidthCss: Double,
+        val future: CompletableFuture<List<Bitmap>>
     ) {
         private val density = ctx.resources.displayMetrics.density
         private val wv = WebView(ctx)
         private var loaded = false
+        private var destroyed = false
 
         fun start(html: String, baseUrl: String?) {
             wv.settings.javaScriptEnabled = true
             wv.settings.loadsImagesAutomatically = true
+            wv.settings.blockNetworkImage = false
             wv.setBackgroundColor(Color.WHITE)
             wv.isVerticalScrollBarEnabled = false
             wv.isHorizontalScrollBarEnabled = false
-            layout(widthPx, 400)
+            val initialW = if (pageWidthCss > 0) ceil(pageWidthCss * density).toInt() else widthPx
+            layout(max(1, initialW), 400)
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String?) {
                     if (loaded) return
                     loaded = true
-                    // počkat na fonty / obrázky (QR kódy)
-                    main.postDelayed({ measure() }, 1200)
+                    // počkat na webové fonty a obrázky (QR kódy)
+                    main.postDelayed({ measure() }, 1500)
                 }
             }
             wv.loadDataWithBaseURL(baseUrl, html, "text/html", "UTF-8", null)
@@ -131,42 +154,71 @@ object Renderers {
         }
 
         private fun measure() {
-            val js = "(function(){var b=document.body,d=document.documentElement;" +
-                    "var r=b.getBoundingClientRect();" +
-                    "return {w:Math.ceil(Math.max(r.right,1)),h:Math.ceil(Math.max(d.scrollHeight,b.scrollHeight,r.bottom))};})()"
-            wv.evaluateJavascript(js) { result ->
+            if (destroyed) return
+            wv.evaluateJavascript(MEASURE_JS) { result ->
                 try {
                     val o = JSONObject(result)
-                    val cssW = o.getDouble("w")
+                    val cssW = if (pageWidthCss > 0) pageWidthCss else o.getDouble("w")
                     val cssH = o.getDouble("h")
                     val pxW = max(1, ceil(cssW * density).toInt())
-                    val pxH = min(30000, max(1, ceil(cssH * density).toInt()))
+                    // strop ~20 Mpx kvůli paměti
+                    val maxH = max(1, 20_000_000 / pxW)
+                    val pxH = min(maxH, max(1, ceil(cssH * density).toInt()))
+                    val arr = o.optJSONArray("cuts")
+                    val cuts = ArrayList<Int>()
+                    if (arr != null) for (i in 0 until arr.length()) {
+                        cuts.add((arr.optDouble(i) * density).roundToInt())
+                    }
                     layout(pxW, pxH)
-                    main.postDelayed({ draw(pxW, pxH) }, 400)
+                    main.postDelayed({ draw(pxW, pxH, cuts) }, 500)
                 } catch (e: Throwable) {
-                    finish(e)
+                    fail(e)
                 }
             }
         }
 
-        private fun draw(pxW: Int, pxH: Int) {
+        private fun draw(pxW: Int, pxH: Int, cutsPx: List<Int>) {
+            if (destroyed) return
             try {
                 val bmp = Bitmap.createBitmap(pxW, pxH, Bitmap.Config.ARGB_8888)
                 bmp.eraseColor(Color.WHITE)
                 wv.draw(Canvas(bmp))
-                val outH = max(1, (pxH * (widthPx.toFloat() / pxW)).roundToInt())
+                val k = widthPx.toFloat() / pxW
+                val outH = max(1, (pxH * k).roundToInt())
                 val out = if (pxW == widthPx) bmp else Bitmap.createScaledBitmap(bmp, widthPx, outH, true)
-                future.complete(out)
+
+                // rozdělit na stránky podle zlomů
+                val bounds = cutsPx.map { (it * k).roundToInt() }
+                    .filter { it in 20 until outH - 20 }
+                    .distinct().sorted()
+                val pages = ArrayList<Bitmap>()
+                var y0 = 0
+                for (y in bounds + outH) {
+                    if (y - y0 >= 20) pages.add(Bitmap.createBitmap(out, 0, y0, widthPx, y - y0))
+                    y0 = y
+                }
+                if (pages.isEmpty()) pages.add(out)
+                BridgeLog.i("HTML vykresleno: ${pages.size} str., ${widthPx}×$outH bodů")
+                future.complete(pages)
             } catch (e: Throwable) {
                 future.completeExceptionally(e)
             } finally {
-                wv.destroy()
+                abort()
             }
         }
 
-        private fun finish(e: Throwable) {
+        private fun fail(e: Throwable) {
             future.completeExceptionally(e)
-            wv.destroy()
+            abort()
+        }
+
+        fun abort() {
+            if (destroyed) return
+            destroyed = true
+            try {
+                wv.destroy()
+            } catch (ignore: Throwable) {
+            }
         }
     }
 

@@ -82,7 +82,7 @@ class PrintEngine(private val ctx: Context) {
 
         return when (format) {
             "command" -> PrintItem.Raw(
-                when (flavor) {
+                bytesFromArray(item.opt("data")) ?: when (flavor) {
                     "base64" -> decodeBase64(payload)
                     "hex" -> decodeHex(payload)
                     "file" -> download(payload)
@@ -108,7 +108,9 @@ class PrintEngine(private val ctx: Context) {
                 } else {
                     String(download(payload), Charsets.UTF_8) to payload
                 }
-                pages(listOf(Renderers.renderHtml(ctx, html, base, width)))
+                // entradio: options.pageWidth = 80 (+ units: 'mm' v konfiguraci tiskárny)
+                val pageWidthCss = cssPx(item.optJSONObject("options")?.optDouble("pageWidth", 0.0) ?: 0.0, jobOptions)
+                pages(Renderers.renderHtml(ctx, html, base, width, pageWidthCss))
             }
 
             else -> throw IOException("Formát '$format' není podporován")
@@ -122,6 +124,29 @@ class PrintEngine(private val ctx: Context) {
         }
         if (out.isEmpty()) throw IOException("Dokument je prázdný")
         return PrintItem.Pages(out)
+    }
+
+    /** Převod rozměru z jednotek úlohy (in / mm / cm) na CSS pixely (96 dpi). */
+    private fun cssPx(value: Double, jobOptions: JSONObject): Double {
+        if (value.isNaN() || value <= 0) return 0.0
+        return when (jobOptions.str("units").lowercase()) {
+            "mm" -> value * 96.0 / 25.4
+            "cm" -> value * 96.0 / 2.54
+            else -> value * 96.0 // výchozí jednotka QZ jsou palce
+        }
+    }
+
+    /**
+     * Starší qz-tray.js neumí převést Uint8Array na hex a pošle ho jako {"0":27,"1":64,…}
+     * nebo jako pole čísel. Takový tvar převedeme rovnou na bajty.
+     */
+    private fun bytesFromArray(v: Any?): ByteArray? = when (v) {
+        is JSONArray -> ByteArray(v.length()) { i -> v.optInt(i).toByte() }
+        is JSONObject -> {
+            val n = v.length()
+            if (n > 0 && v.has("0")) ByteArray(n) { i -> v.optInt(i.toString()).toByte() } else null
+        }
+        else -> null
     }
 
     private fun encode(text: String, opts: JSONObject): ByteArray {
@@ -144,7 +169,7 @@ class PrintEngine(private val ctx: Context) {
     }
 
     private fun decodeHex(s: String): ByteArray {
-        val clean = s.replace(Regex("(?i)0x|x|[^0-9a-f]"), "")
+        val clean = s.replace(Regex("(?i)0x"), "").replace(Regex("(?i)[^0-9a-f]"), "")
         return ByteArray(clean.length / 2) { i -> clean.substring(i * 2, i * 2 + 2).toInt(16).toByte() }
     }
 
